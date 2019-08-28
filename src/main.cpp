@@ -6,42 +6,47 @@
 #include <WiFiManager.h>         // https://github.com/tzapu/WiFiManager
 #include <ArduinoJson.h>         // https://github.com/bblanchon/ArduinoJson
 #include <DoubleResetDetector.h> // https://github.com/datacute/DoubleResetDetector
+#include <PubSubClient.h>        // https://github.com/knolleary/pubsubclient
 
-/******************************************************************************************************
- ** File System
- ******************************************************************************************************/
+#include "user_config.h" // Fixed user configurable options
+#ifdef USE_CONFIG_OVERRIDE
+#include "user_config_override.h" // Configuration overrides for my_user_config.h
+#endif
+
+/* --------------------------------------------------------------------------------------------------
+ * File System
+ * -------------------------------------------------------------------------------------------------- */
 // Methods
 boolean loadConfig();
 boolean saveConfig();
 
-/******************************************************************************************************
- ** Double Reset Detector
- ******************************************************************************************************/
-// Number of seconds after reset during which a
-// subseqent reset will be considered a double reset.
-#define DRD_TIMEOUT 10
-
-// RTC Memory Address for the DoubleResetDetector to use
-#define DRD_ADDRESS 0
-
+/* --------------------------------------------------------------------------------------------------
+ * Double Reset Detector
+ * -------------------------------------------------------------------------------------------------- */
+// Initialize
 DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
 
-/******************************************************************************************************
- ** WiFiManager
- ******************************************************************************************************/
-// Methods
+
+/* --------------------------------------------------------------------------------------------------
+ * WiFiManager
+ * -------------------------------------------------------------------------------------------------- */
+// function declaration
 void saveConfigCallback();
 void configModeCallback(WiFiManager *myWiFiManager);
 void forceConfigMode();
 
 // define your default values here, if there are different values in config.json, they are overwritten.
-char mqtt_server[40];
-char mqtt_port[6] = "8080";
-char mqtt_username[50] = "UserName";
-char mqtt_password[50] = "Password";
+char mqtt_server[40] = MQTT_SERVER;
+char mqtt_port[6] = MQTT_SERVER_PORT;
+char mqtt_username[50] = MQTT_USERNAME;
+char mqtt_password[50] = MQTT_PASSWORD;
 
 bool shouldSaveConfig = false; //flag for saving data
 
+
+/* --------------------------------------------------------------------------------------------------
+ * Main Setup & loop
+ * -------------------------------------------------------------------------------------------------- */
 void setup()
 {
   Serial.begin(115200);
@@ -130,9 +135,9 @@ void loop()
   drd.loop();
 }
 
-/******************************************************************************************************
- ** File System
- ******************************************************************************************************/
+/* --------------------------------------------------------------------------------------------------
+ * File System
+ * -------------------------------------------------------------------------------------------------- */
 boolean loadConfig()
 {
   File configFile = SPIFFS.open("/config.json", "r");
@@ -195,11 +200,11 @@ boolean saveConfig()
   return true;
 }
 
-/******************************************************************************************************
- ** WiFiManager
- ******************************************************************************************************/
+/* --------------------------------------------------------------------------------------------------
+ * WiFi Manager
+ * -------------------------------------------------------------------------------------------------- */
 
-//callback notifying us of the need to save config
+// Callback notifying us of the need to save config
 void saveConfigCallback()
 {
   Serial.println("Should save config");
