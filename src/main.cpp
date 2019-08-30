@@ -7,17 +7,26 @@
 #include <ArduinoJson.h>         // https://github.com/bblanchon/ArduinoJson
 #include <DoubleResetDetector.h> // https://github.com/datacute/DoubleResetDetector
 #include <PubSubClient.h>        // https://github.com/knolleary/pubsubclient
+#include <ArduinoOTA.h>          // https://github.com/esp8266/Arduino/tree/master/libraries/ArduinoOTA
 
 #include "user_config.h" // Fixed user configurable options
 #ifdef USE_CONFIG_OVERRIDE
 #include "user_config_override.h" // Configuration overrides for my_user_config.h
 #endif
 
+// Display debug output
+#ifdef DEBUG
+bool enableDebug = true;
+#else
+bool enableDebug = false;
+#endif
+
 /* --------------------------------------------------------------------------------------------------
  * File System
  * -------------------------------------------------------------------------------------------------- */
 // Methods
-boolean loadConfig();
+boolean
+loadConfig();
 boolean saveConfig();
 
 /* --------------------------------------------------------------------------------------------------
@@ -25,7 +34,6 @@ boolean saveConfig();
  * -------------------------------------------------------------------------------------------------- */
 // Initialize
 DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
-
 
 /* --------------------------------------------------------------------------------------------------
  * WiFiManager
@@ -42,7 +50,6 @@ char mqtt_username[50] = MQTT_USERNAME;
 char mqtt_password[50] = MQTT_PASSWORD;
 
 bool shouldSaveConfig = false; //flag for saving data
-
 
 /* --------------------------------------------------------------------------------------------------
  * Main Setup & loop
@@ -62,6 +69,9 @@ void setup()
   digitalWrite(LED_BUILTIN, LOW); // Turn the LED on (Note that LOW is the voltage level
   loadConfig();
 
+  // Over the air
+  ArduinoOTA.begin();
+
   WiFiManager wifiManager;
   wifiManager.setAPCallback(configModeCallback);
   wifiManager.setSaveConfigCallback(saveConfigCallback);
@@ -70,6 +80,7 @@ void setup()
       IPAddress(10, 0, 1, 1),
       IPAddress(255, 255, 255, 0));
   wifiManager.setMinimumSignalQuality(30);
+  wifiManager.setDebugOutput(enableDebug);
 
   // Adding an additional config on the WIFI manager webpage for the MQTT Server.
   WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
@@ -128,6 +139,9 @@ void setup()
 
 void loop()
 {
+  // Over the air
+  ArduinoOTA.handle();
+
   // Call the double reset detector loop method every so often,
   // so that it can recognise when the timeout expires.
   // You can also call drd.stop() when you wish to no longer
