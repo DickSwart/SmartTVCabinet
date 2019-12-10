@@ -1,243 +1,427 @@
 #include <Arduino.h>
-#include <FS.h>
-#include <ESP8266WiFi.h> // https://github.com/esp8266/Arduino
-#include <DNSServer.h>
-#include <ESP8266WebServer.h>
-#include <WiFiManager.h>         // https://github.com/tzapu/WiFiManager
-#include <ArduinoJson.h>         // https://github.com/bblanchon/ArduinoJson
-#include <DoubleResetDetector.h> // https://github.com/datacute/DoubleResetDetector
-#include <PubSubClient.h>        // https://github.com/knolleary/pubsubclient
-#include <ArduinoOTA.h>          // https://github.com/esp8266/Arduino/tree/master/libraries/ArduinoOTA
+#include <ESP8266WiFi.h>  //if you get an error here you need to install the ESP8266 board manager
+#include <ESP8266mDNS.h>  //if you get an error here you need to install the ESP8266 board manager
+#include <PubSubClient.h> //https://github.com/knolleary/pubsubclient
+#include <ArduinoOTA.h>   //https://github.com/esp8266/Arduino/tree/master/libraries/ArduinoOTA
+#include <SimpleTimer.h>  //https://github.com/marcelloromani/Arduino-SimpleTimer/tree/master/SimpleTimer
 
 #include "user_config.h" // Fixed user configurable options
 #ifdef USE_CONFIG_OVERRIDE
 #include "user_config_override.h" // Configuration overrides for my_user_config.h
 #endif
 
-// Display debug output
-#ifdef DEBUG
-bool enableDebug = true;
-#else
-bool enableDebug = false;
-#endif
+///////////////////////////////////////////////////////////////////////////
+//   General Declarations
+///////////////////////////////////////////////////////////////////////////
 
-/* --------------------------------------------------------------------------------------------------
- * File System
- * -------------------------------------------------------------------------------------------------- */
-// Methods
-boolean
-loadConfig();
-boolean saveConfig();
+char ESP_CHIP_ID[7] = {0};
+char OTA_HOSTNAME[sizeof(ESP_CHIP_ID) + sizeof(OTA_HOSTNAME_TEMPLATE) - 2] = {0};
 
-/* --------------------------------------------------------------------------------------------------
- * Double Reset Detector
- * -------------------------------------------------------------------------------------------------- */
-// Initialize
-DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
-
-/* --------------------------------------------------------------------------------------------------
- * WiFiManager
- * -------------------------------------------------------------------------------------------------- */
+///////////////////////////////////////////////////////////////////////////
+//   WiFi
+///////////////////////////////////////////////////////////////////////////
 // function declaration
-void saveConfigCallback();
-void configModeCallback(WiFiManager *myWiFiManager);
-void forceConfigMode();
+void setupWiFi(void);
+void connectWiFi(void);
+void onConnected(const WiFiEventStationModeConnected &event);
+void onDisconnect(const WiFiEventStationModeDisconnected &event);
+void onGotIP(const WiFiEventStationModeGotIP &event);
+void loopWiFiSensor(void);
+int getWiFiSignalStrength(void);
 
-// define your default values here, if there are different values in config.json, they are overwritten.
-char mqtt_server[40] = MQTT_SERVER;
-char mqtt_port[6] = MQTT_SERVER_PORT;
-char mqtt_username[50] = MQTT_USERNAME;
-char mqtt_password[50] = MQTT_PASSWORD;
+// variables declaration
+int previousWiFiSignalStrength = -1;
+unsigned long previousMillis = 0;
+int reqConnect = 0;
+int isConnected = 0;
+const long interval = 500;
+const long reqConnectNum = 15; // number of intervals to wait for connection
+WiFiEventHandler mConnectHandler;
+WiFiEventHandler mDisConnectHandler;
+WiFiEventHandler mGotIpHandler;
 
-bool shouldSaveConfig = false; //flag for saving data
+// Initialize the Ethernet wifiClient object
+WiFiClient wifiClient;
 
-/* --------------------------------------------------------------------------------------------------
- * Main Setup & loop
- * -------------------------------------------------------------------------------------------------- */
+/* -------------------------------------------------
+ *  MQTT
+ * ------------------------------------------------- */
+// function declaration
+void setupMQTT();
+void connectToMQTT();
+void checkInMQTT();
+void subscribeToMQTT(char *p_topic);
+void publishToMQTT(char *p_topic, char *p_payload, bool retain = true);
+void handleMQTTMessage(char *topic, byte *payload, unsigned int length);
+
+// variables declaration
+bool boot;
+char MQTT_PAYLOAD[8] = {0};
+char MQTT_AVAILABILITY_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_AVAILABILITY_TOPIC_TEMPLATE) - 2] = {0};
+char MQTT_WIFI_QUALITY_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(WIFI_QUALITY_SENSOR_NAME) - 4] = {0};
+// char MQTT_DOOR_SENSOR_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(DOOR_SENSOR_NAME) - 4] = {0};
+// char MQTT_LDR_SENSOR_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(LDR_SENSOR_NAME) - 4] = {0};
+// char MQTT_PIR_SENSOR_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(PIR_SENSOR_NAME) - 4] = {0};
+// char MQTT_SIREN_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(SIREN_NAME) - 4] = {0};
+// char MQTT_SIREN_COMMAND_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_COMMAND_TOPIC_TEMPLATE) + sizeof(SIREN_NAME) - 4] = {0};
+// char MQTT_DHT_TEMP_SENSOR_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(DHT_TEMPERATURE_SENSOR_NAME) - 4] = {0};
+// char MQTT_DHT_HUMIDITY_SENSOR_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(DHT_HUMIDITY_SENSOR_NAME) - 4] = {0};
+// char MQTT_DHT_REALFEEL_SENSOR_TOPIC[sizeof(ESP_CHIP_ID) + sizeof(MQTT_SENSOR_TOPIC_TEMPLATE) + sizeof(DHT_REALFEEL_SENSOR_NAME) - 4] = {0};
+
+// Initialize the mqtt mqttClient object
+PubSubClient mqttClient(wifiClient);
+
+///////////////////////////////////////////////////////////////////////////
+//   SimpleTimer
+///////////////////////////////////////////////////////////////////////////
+SimpleTimer timer;
+
+///////////////////////////////////////////////////////////////////////////
+//  MAIN SETUP AND LOOP
+///////////////////////////////////////////////////////////////////////////
+
 void setup()
 {
   Serial.begin(115200);
-  Serial.println();
 
-  if (!SPIFFS.begin())
-  {
-    Serial.println("Failed to mount File system");
-    return;
-  }
+  boot == true;
+  // Set the chip ID
+  sprintf(ESP_CHIP_ID, "%06X", ESP.getChipId());
 
-  pinMode(LED_BUILTIN, OUTPUT);   // Initialize the LED_BUILTIN pin as an output
-  digitalWrite(LED_BUILTIN, LOW); // Turn the LED on (Note that LOW is the voltage level
-  loadConfig();
+  // WIFI
+  setupWiFi();
+
+  // MQTT
+  setupMQTT();
 
   // Over the air
+  sprintf(OTA_HOSTNAME, OTA_HOSTNAME_TEMPLATE, ESP_CHIP_ID);
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.begin();
 
-  WiFiManager wifiManager;
-  wifiManager.setAPCallback(configModeCallback);
-  wifiManager.setSaveConfigCallback(saveConfigCallback);
-  wifiManager.setSTAStaticIPConfig(
-      IPAddress(10, 0, 1, 99),
-      IPAddress(10, 0, 1, 1),
-      IPAddress(255, 255, 255, 0));
-  wifiManager.setMinimumSignalQuality(30);
-  wifiManager.setDebugOutput(enableDebug);
+  delay(10);
 
-  // Adding an additional config on the WIFI manager webpage for the MQTT Server.
-  WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
-  WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 6);
-  WiFiManagerParameter custom_mqtt_username("username", "mqtt username", mqtt_username, 50);
-  WiFiManagerParameter custom_mqtt_password("password", "mqtt password", mqtt_password, 50);
-  wifiManager.addParameter(&custom_mqtt_server);
-  wifiManager.addParameter(&custom_mqtt_port);
-  wifiManager.addParameter(&custom_mqtt_username);
-  wifiManager.addParameter(&custom_mqtt_password);
-
-  String ssid = "SwartNinjaNoT" + String(ESP.getChipId());
-  if (drd.detectDoubleReset())
-  {
-    Serial.println("Double Reset Detected");
-    wifiManager.startConfigPortal(ssid.c_str(), "SwartNinja");
-  }
-  else
-  {
-    Serial.println("No Double Reset Detected");
-    wifiManager.autoConnect(ssid.c_str(), "SwartNinja");
-  }
-
-  // read updated parameters
-  strcpy(mqtt_server, custom_mqtt_server.getValue());
-  strcpy(mqtt_port, custom_mqtt_port.getValue());
-  strcpy(mqtt_username, custom_mqtt_username.getValue());
-  strcpy(mqtt_password, custom_mqtt_password.getValue());
-
-  if (shouldSaveConfig)
-  {
-    saveConfig();
-  }
-
-  digitalWrite(LED_BUILTIN, HIGH); // Turn the LED off by making the voltage HIGH
-
-  if ((strcmp(mqtt_server, "") > 0) && (strcmp(mqtt_port, "") > 0))
-  {
-    Serial.println("Initialise MQTT Server");
-    // TODO: ADD CODE
-  }
-  else
-  {
-    Serial.println("Forcing Config Mode");
-    forceConfigMode();
-  }
-
-  // Print Network Info
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  drd.stop();
+  timer.setInterval(120000, checkInMQTT);
 }
 
 void loop()
 {
-  // Over the air
-  ArduinoOTA.handle();
+  // WIFI
+  connectWiFi();
 
-  // Call the double reset detector loop method every so often,
-  // so that it can recognise when the timeout expires.
-  // You can also call drd.stop() when you wish to no longer
-  // consider the next reset as a double reset.
-  drd.loop();
-}
-
-/* --------------------------------------------------------------------------------------------------
- * File System
- * -------------------------------------------------------------------------------------------------- */
-boolean loadConfig()
-{
-  File configFile = SPIFFS.open("/config.json", "r");
-  if (!configFile)
+  // Code will only run if connected to WiFi
+  if (isConnected == 2)
   {
-    Serial.println("Failed to open config file");
-    return false;
+    // MQTT
+    if (!mqttClient.connected())
+    {
+      connectToMQTT();
+    }
+    mqttClient.loop();
+
+    // Over the air
+    ArduinoOTA.handle();
+
+    // Check WiFi signal
+    loopWiFiSensor();
+
+    timer.run();
   }
-
-  size_t size = configFile.size();
-  if (size > 1024)
-  {
-    Serial.println("Config file size is too large");
-    return false;
-  }
-
-  // Allocate a buffer to store contents of the file.
-  std::unique_ptr<char[]> buf(new char[size]);
-
-  configFile.readBytes(buf.get(), size);
-
-  DynamicJsonDocument doc(1024);
-  DeserializationError error = deserializeJson(doc, buf.get());
-  if (error)
-  {
-    Serial.print(F("deserializeJson() failed with code "));
-    Serial.println(error.c_str());
-    return false;
-  }
-
-  strcpy(mqtt_server, doc["mqtt_server"]);
-  strcpy(mqtt_port, doc["mqtt_port"]);
-  strcpy(mqtt_username, doc["mqtt_username"]);
-  strcpy(mqtt_password, doc["mqtt_password"]);
-
-  configFile.close();
-  return true;
 }
 
-boolean saveConfig()
+///////////////////////////////////////////////////////////////////////////
+//   WiFi
+///////////////////////////////////////////////////////////////////////////
+
+/*
+ * Function called to setup WiFi module
+ */
+void setupWiFi(void)
 {
-  Serial.println("Save config file to file system.");
-
-  DynamicJsonDocument doc(1024);
-  doc["mqtt_server"] = mqtt_server;
-  doc["mqtt_port"] = mqtt_port;
-  doc["mqtt_username"] = mqtt_username;
-  doc["mqtt_password"] = mqtt_password;
-  serializeJson(doc, Serial);
-
-  File configFile = SPIFFS.open("/config.json", "w");
-  if (!configFile)
-  {
-    Serial.println("Failed to open config file for writing.");
-    return false;
-  }
-
-  serializeJson(doc, configFile);
-  configFile.close();
-  return true;
-}
-
-/* --------------------------------------------------------------------------------------------------
- * WiFi Manager
- * -------------------------------------------------------------------------------------------------- */
-
-// Callback notifying us of the need to save config
-void saveConfigCallback()
-{
-  Serial.println("Should save config");
-  shouldSaveConfig = true;
-}
-
-// You could indicate on your screen or by an LED you are in config mode here
-// We don't want the next time the board resets to be considered a double reset
-// so we remove the flag
-void configModeCallback(WiFiManager *myWiFiManager)
-{
-  drd.stop();
-}
-
-void forceConfigMode()
-{
-  Serial.println("Reset");
   WiFi.disconnect();
-  delay(500);
-  ESP.restart();
-  delay(5000);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+
+  mConnectHandler = WiFi.onStationModeConnected(onConnected);
+  mDisConnectHandler = WiFi.onStationModeDisconnected(onDisconnect);
+  mGotIpHandler = WiFi.onStationModeGotIP(onGotIP);
+}
+
+/*
+ * Function called to connect to WiFi
+ */
+void connectWiFi(void)
+{
+  if (WiFi.status() != WL_CONNECTED && reqConnect > reqConnectNum && isConnected < 2)
+  {
+    reqConnect = 0;
+    isConnected = 0;
+    WiFi.disconnect();
+
+    Serial.println();
+    Serial.print("[WIFI]: Attempting to connect to WPA SSID: ");
+    Serial.println(WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.println("[WIFI]: Connecting...");
+  }
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval)
+  {
+    previousMillis = currentMillis;
+    reqConnect++;
+  }
+}
+
+/*
+ * Function called to handle WiFi events
+ */
+void onConnected(const WiFiEventStationModeConnected &event)
+{
+  char macAdddress[20];
+  sprintf(macAdddress, "%02X:%02X:%02X:%02X:%02X:%02X", event.bssid[5], event.bssid[4], event.bssid[3], event.bssid[2], event.bssid[1], event.bssid[0]);
+  Serial.print(F("[WIFI]: You're connected to the AP. (MAC - "));
+  Serial.print(macAdddress);
+  Serial.println(")");
+  isConnected = 1;
+}
+
+void onDisconnect(const WiFiEventStationModeDisconnected &event)
+{
+  Serial.println("[WIFI]: Disconnected");
+  Serial.print("[WIFI]: Reason: ");
+  Serial.println(event.reason);
+  isConnected = 0;
+}
+
+void onGotIP(const WiFiEventStationModeGotIP &event)
+{
+  Serial.print("[WIFI]: IP Address : ");
+  Serial.println(event.ip);
+  Serial.print("[WIFI]: Subnet     : ");
+  Serial.println(event.mask);
+  Serial.print("[WIFI]: Gateway    : ");
+  Serial.println(event.gw);
+
+  isConnected = 2;
+}
+
+/*
+ * Function to check WiFi signal strength
+ */
+void loopWiFiSensor(void)
+{
+  static unsigned long lastWiFiQualityMeasure = 0;
+  if (lastWiFiQualityMeasure + WIFI_QUALITY_INTERVAL <= millis() || previousWiFiSignalStrength == -1)
+  {
+    lastWiFiQualityMeasure = millis();
+    int currentWiFiSignalStrength = getWiFiSignalStrength();
+    if (isnan(previousWiFiSignalStrength) || currentWiFiSignalStrength <= previousWiFiSignalStrength - WIFI_QUALITY_OFFSET_VALUE || currentWiFiSignalStrength >= previousWiFiSignalStrength + WIFI_QUALITY_OFFSET_VALUE)
+    {
+      previousWiFiSignalStrength = currentWiFiSignalStrength;
+      dtostrf(currentWiFiSignalStrength, 2, 2, MQTT_PAYLOAD);
+      publishToMQTT(MQTT_WIFI_QUALITY_TOPIC, MQTT_PAYLOAD);
+    }
+  }
+}
+
+/*
+ * Helper function to get the current WiFi signal strength
+ */
+int getWiFiSignalStrength(void)
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return -1;
+  int dBm = WiFi.RSSI();
+  if (dBm <= -100)
+    return 0;
+  if (dBm >= -50)
+    return 100;
+  return 2 * (dBm + 100);
+}
+
+///////////////////////////////////////////////////////////////////////////
+//   MQTT
+///////////////////////////////////////////////////////////////////////////
+
+/*
+ * Function called to setup MQTT topics
+ */
+void setupMQTT()
+{
+  sprintf(MQTT_AVAILABILITY_TOPIC, MQTT_AVAILABILITY_TOPIC_TEMPLATE, ESP_CHIP_ID);
+  Serial.println();
+  Serial.println("---------------------------------------------------------------------------");
+  Serial.print(F("[MQTT]: MQTT availability topic: "));
+  Serial.println(MQTT_AVAILABILITY_TOPIC);
+
+  sprintf(MQTT_WIFI_QUALITY_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, WIFI_QUALITY_SENSOR_NAME);
+  Serial.print(F("[MQTT]: MQTT WiFi Quality topic: "));
+  Serial.println(MQTT_WIFI_QUALITY_TOPIC);
+
+  // sprintf(MQTT_DOOR_SENSOR_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, DOOR_SENSOR_NAME);
+  // Serial.print(F("[MQTT]: MQTT Door topic: "));
+  // Serial.println(MQTT_DOOR_SENSOR_TOPIC);
+
+  // sprintf(MQTT_LDR_SENSOR_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, LDR_SENSOR_NAME);
+  // Serial.print(F("[MQTT]: MQTT LDR topic: "));
+  // Serial.println(MQTT_LDR_SENSOR_TOPIC);
+
+  // sprintf(MQTT_PIR_SENSOR_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, PIR_SENSOR_NAME);
+  // Serial.print(F("[MQTT]: MQTT PIR topic: "));
+  // Serial.println(MQTT_PIR_SENSOR_TOPIC);
+
+  // sprintf(MQTT_DHT_TEMP_SENSOR_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, DHT_TEMPERATURE_SENSOR_NAME);
+  // Serial.print(F("[MQTT]: MQTT temperature topic: "));
+  // Serial.println(MQTT_DHT_TEMP_SENSOR_TOPIC);
+
+  // sprintf(MQTT_DHT_HUMIDITY_SENSOR_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, DHT_HUMIDITY_SENSOR_NAME);
+  // Serial.print(F("[MQTT]: MQTT humidity topic: "));
+  // Serial.println(MQTT_DHT_HUMIDITY_SENSOR_TOPIC);
+
+  // sprintf(MQTT_DHT_REALFEEL_SENSOR_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, DHT_REALFEEL_SENSOR_NAME);
+  // Serial.print(F("[MQTT]: MQTT realfeel topic: "));
+  // Serial.println(MQTT_DHT_REALFEEL_SENSOR_TOPIC);
+
+  // sprintf(MQTT_SIREN_TOPIC, MQTT_SENSOR_TOPIC_TEMPLATE, ESP_CHIP_ID, SIREN_NAME);
+  // Serial.print(F("[MQTT]: MQTT Siren topic: "));
+  // Serial.println(MQTT_SIREN_TOPIC);
+
+  // sprintf(MQTT_SIREN_COMMAND_TOPIC, MQTT_SENSOR_COMMAND_TOPIC_TEMPLATE, ESP_CHIP_ID, SIREN_NAME);
+  // Serial.print(F("[MQTT]: MQTT Siren Command topic: "));
+  // Serial.println(MQTT_SIREN_COMMAND_TOPIC);
+  // Serial.println("---------------------------------------------------------------------------");
+
+  mqttClient.setServer(MQTT_SERVER, MQTT_SERVER_PORT);
+  mqttClient.setCallback(handleMQTTMessage);
+}
+
+void handleMQTTMessage(char *topic, byte *payload, unsigned int length)
+{
+  String newTopic = topic;
+  payload[length] = '\0';
+  String newPayload = String((char *)payload);
+
+#ifdef DEBUG
+  Serial.print("[MQTT]: handleMQTTMessage - Message arrived, topic: ");
+  Serial.print(topic);
+  Serial.print(", payload: ");
+  Serial.println(newPayload);
+  Serial.println();
+#endif
+
+  // if (newTopic == MQTT_SIREN_COMMAND_TOPIC)
+  // {
+  //   Serial.print(F("[MQTT]: MQTT_SIREN_COMMAND_TOPIC: "));
+  //   Serial.println(newTopic);
+  //   Serial.print(F("[MQTT]: equalsIgnoreCase: "));
+  //   Serial.println(newPayload.equalsIgnoreCase(MQTT_PAYLOAD_ON));
+
+  //   if (siren.setState(newPayload.equalsIgnoreCase(MQTT_PAYLOAD_ON)))
+  //   {
+  //     publishToMQTT(MQTT_SIREN_TOPIC, siren.getState());
+  //   }
+  // }
+}
+
+/*
+  Function called to connect/reconnect to the MQTT broker
+*/
+void connectToMQTT()
+{
+  int retries = 0;
+  // Loop until we're connected / reconnected
+  while (!mqttClient.connected())
+  {
+    if (retries < 150)
+    {
+      Serial.println("[MQTT]: Attempting MQTT connection...");
+      if (mqttClient.connect(ESP_CHIP_ID, MQTT_USERNAME, MQTT_PASSWORD, MQTT_AVAILABILITY_TOPIC, 0, 1, "offline"))
+      {
+
+        Serial.println(F("[MQTT]: The mqttClient is successfully connected to the MQTT broker"));
+        publishToMQTT(MQTT_AVAILABILITY_TOPIC, "online");
+        if (boot == false)
+        {
+          Serial.println(F("[MQTT]: Reconnected"));
+        }
+        if (boot == true)
+        {
+          Serial.println(F("[MQTT]: Rebooted"));
+          boot == false;
+        }
+
+        // // publish messages
+        // publishToMQTT(MQTT_SIREN_TOPIC, siren.getState());
+
+        // // ... and resubscribe
+        // subscribeToMQTT(MQTT_SIREN_COMMAND_TOPIC);
+      }
+      else
+      {
+        retries++;
+#ifdef DEBUG
+        Serial.println(F("[MQTT]: ERROR - The connection to the MQTT broker failed"));
+        Serial.print(F("[MQTT]: MQTT username: "));
+        Serial.println(MQTT_USERNAME);
+        Serial.print(F("[MQTT]: MQTT password: "));
+        Serial.println(MQTT_PASSWORD);
+        Serial.print(F("[MQTT]: MQTT broker: "));
+        Serial.println(MQTT_SERVER);
+        Serial.print(F("[MQTT]: Retries: "));
+        Serial.println(retries);
+#endif
+        // Wait 5 seconds before retrying
+        delay(5000);
+      }
+    }
+    if (retries > 149)
+    {
+      ESP.restart();
+    }
+  }
+}
+
+void checkInMQTT()
+{
+  publishToMQTT(MQTT_AVAILABILITY_TOPIC, "online", false);
+  timer.setTimeout(120000, checkInMQTT);
+}
+
+/*
+  Function called to subscribe to a MQTT topic
+*/
+void subscribeToMQTT(char *p_topic)
+{
+  if (mqttClient.subscribe(p_topic))
+  {
+    Serial.print(F("[MQTT]: subscribeToMQTT - Sending the MQTT subscribe succeeded for topic: "));
+    Serial.println(p_topic);
+  }
+  else
+  {
+    Serial.print(F("[MQTT]: subscribeToMQTT - ERROR, Sending the MQTT subscribe failed for topic: "));
+    Serial.println(p_topic);
+  }
+}
+
+/*
+  Function called to publish to a MQTT topic with the given payload
+*/
+void publishToMQTT(char *p_topic, char *p_payload, bool retain)
+{
+  if (mqttClient.publish(p_topic, p_payload, retain))
+  {
+    Serial.print(F("[MQTT]: publishToMQTT - MQTT message published successfully, topic: "));
+    Serial.print(p_topic);
+    Serial.print(F(", payload: "));
+    Serial.println(p_payload);
+  }
+  else
+  {
+    Serial.println(F("[MQTT]: publishToMQTT - ERROR, MQTT message not published, either connection lost, or message too large. Topic: "));
+    Serial.print(p_topic);
+    Serial.print(F(" , payload: "));
+    Serial.println(p_payload);
+  }
 }
